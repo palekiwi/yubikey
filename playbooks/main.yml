@@ -1,0 +1,76 @@
+---
+- name: Set up yubikey after fresh install.
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: Ensure hostname is set.
+      ansible.builtin.hostname:
+        name: "{{ hostname }}"
+        use: systemd
+
+    - name: Run tasks for user {{ user }}.
+      become: true
+      become_user: "{{ user }}"
+      block:
+        - name: Ensure public key is present.
+          ansible.builtin.command:
+            cmd: gpg --recv-keys {{ public_key }}
+          register: recv_key_out
+          changed_when: '"not changed" not in recv_key_out.stderr'
+
+        - name: Ensure gpg-agent.conf template is installed.
+          ansible.builtin.template:
+            src: ./templates/gpg-agent.conf.j2
+            dest: ~/.gnupg/gpg-agent.conf
+            mode: "0644"
+
+        - name: Ensure SSH_TTY_SOCK is configured via gpgconf.
+          ansible.builtin.blockinfile:
+            path: ~/.bashrc
+            prepend_newline: true
+            block: |
+              if [[ -z $SSH_CONNECTION ]]; then
+                export GPG_TTY="$(tty)"
+                export SSH_AUTH_SOCK=$(gpgconf --list-dirs agent-ssh-socket)
+                gpgconf --launch gpg-agent
+              fi
+
+    - name: Ensure pcscd.service is started and enabled.
+      ansible.builtin.service:
+        name: pcscd
+        state: started
+        enabled: true
+
+    - name: Set up tailscale.
+      block:
+        - name: Add tailscale repository.
+          ansible.builtin.yum_repository:
+            name: tailscale
+            description: Tailscale stable
+            baseurl: https://pkgs.tailscale.com/stable/fedora/$basearch
+            gpgkey: https://pkgs.tailscale.com/stable/fedora/repo.gpg
+            gpgcheck: false
+            repo_gpgcheck: true
+            enabled: true
+
+        - name: Check if tailscale is already installed.
+          ansible.builtin.stat:
+            path: /usr/bin/tailscale
+          register: stat_tailscale
+
+        - name: Install tailscale.
+          when: not stat_tailscale.stat.exists
+          block:
+            - name: Ensure tailscale is installed.
+              community.general.rpm_ostree_pkg:
+                name: tailscale
+                state: present
+
+            - name: Print a reminder to reboot.
+              ansible.builtin.debug:
+                msg: "Reboot to apply ostree changes: `sudo systemctl reboot`"
